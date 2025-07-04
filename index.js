@@ -8,11 +8,10 @@ const port = process.env.PORT || 10000;
 
 // Sử dụng CORS để cho phép các yêu cầu từ tên miền khác
 app.use(cors());
-app.use(express.json({ limit: '10mb' })); // Tăng giới hạn payload để nhận HTML
+app.use(express.json({ limit: '10mb' }));
 
 // --- HÀM HỖ TRỢ ---
 
-// Hàm khởi tạo trình duyệt Puppeteer
 async function launchBrowser() {
     return puppeteer.launch({
         args: [
@@ -29,7 +28,6 @@ async function launchBrowser() {
     });
 }
 
-// Hàm gọi Gemini API
 async function callGemini(apiKey, prompt, jsonMode = false) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
@@ -38,7 +36,6 @@ async function callGemini(apiKey, prompt, jsonMode = false) {
         const result = await model.generateContent(prompt + "\n\nChỉ trả về JSON, không có markdown.");
         const response = await result.response;
         let text = response.text();
-        // Cố gắng làm sạch và parse JSON
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
         return JSON.parse(text);
     } else {
@@ -51,70 +48,94 @@ async function callGemini(apiKey, prompt, jsonMode = false) {
 // --- ENDPOINTS API ---
 
 app.get('/', (req, res) => {
-    res.status(200).send('Crawl4ai service is running! Version 2.0 (Production)');
+    res.status(200).send('Crawl4ai service is running! Version 3.0 (Production Ready)');
 });
 
 app.post('/crawl', async (req, res) => {
-    const { geminiApiKey, discoveryQuery } = req.body;
+    const { geminiApiKey, discoveryQuery, tasks } = req.body;
 
     if (!geminiApiKey) return res.status(400).json({ error: 'Thiếu Gemini API Key.' });
-    if (!discoveryQuery) return res.status(400).json({ error: 'Thiếu discoveryQuery.' });
+    if (!discoveryQuery && !tasks) return res.status(400).json({ error: 'Phải có discoveryQuery hoặc tasks.' });
 
-    console.log(`Nhận yêu cầu tìm kiếm cho: "${discoveryQuery}"`);
     let browser = null;
-
     try {
-        // 1. Dùng Gemini để tìm URL
-        console.log("Bước 1: Dùng Gemini tìm URL...");
-        const urlPrompt = `Tìm kiếm trên Google các trang web bán hàng tại Việt Nam cho sản phẩm "${discoveryQuery}". Trả về một danh sách JSON của tối đa 3 URL sản phẩm trực tiếp. Định dạng: [{"sourceName": "Tên trang web", "url": "URL sản phẩm"}]`;
-        const sources = await callGemini(geminiApiKey, urlPrompt, true);
-        if (!sources || sources.length === 0) {
-            return res.status(200).json([]);
-        }
-        console.log(`Đã tìm thấy ${sources.length} URL.`);
-
-        // 2. Crawl và phân tích từng URL
+        console.log("Khởi động trình duyệt...");
         browser = await launchBrowser();
         const page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36');
 
-        const results = [];
-        for (const source of sources) {
-            try {
-                console.log(`Bước 2: Đang xử lý ${source.url}`);
-                await page.goto(source.url, { waitUntil: 'networkidle2', timeout: 30000 });
-                const pageHtml = await page.content();
+        let results = [];
 
-                // 3. Dùng Gemini để tìm selector
-                console.log("Bước 3: Dùng Gemini tìm selector giá...");
-                const selectorPrompt = `Phân tích mã HTML sau và tìm CSS selector chính xác nhất cho giá chính của sản phẩm. Chỉ trả về một đối tượng JSON có dạng {"selector": "your-css-selector"}. HTML: ${pageHtml.substring(0, 5000)}`;
-                const { selector } = await callGemini(geminiApiKey, selectorPrompt, true);
-                if (!selector) throw new Error("AI không tìm được selector.");
+        // --- LUỒNG 1: KIỂM TRA GIÁ (TASKS) ---
+        if (tasks && tasks.length > 0) {
+            console.log(`Nhận yêu cầu kiểm tra giá cho ${tasks.length} sản phẩm.`);
+            for (const task of tasks) {
+                try {
+                    console.log(`Đang kiểm tra: ${task.url}`);
+                    await page.goto(task.url, { waitUntil: 'networkidle2', timeout: 30000 });
+                    
+                    const priceData = await page.evaluate((sel) => {
+                        const el = document.querySelector(sel);
+                        return {
+                            price: el ? el.textContent.trim() : null,
+                            html: el ? el.outerHTML : null,
+                        };
+                    }, task.selector);
 
-                // 4. Trích xuất giá bằng selector
-                const priceText = await page.evaluate((sel) => {
-                    const el = document.querySelector(sel);
-                    return el ? el.textContent.trim() : null;
-                }, selector);
+                    if (!priceData.price) throw new Error(`Không tìm thấy giá với selector: ${task.selector}`);
+                    
+                    results.push({ status: 'success', data: priceData });
+                } catch (err) {
+                    console.warn(`Lỗi khi kiểm tra ${task.url}: ${err.message}`);
+                    results.push({ status: 'error', url: task.url, error: err.message });
+                }
+            }
+        }
+        // --- LUỒNG 2: TÌM KIẾM NGUỒN MỚI (DISCOVERY) ---
+        else if (discoveryQuery) {
+            console.log(`Nhận yêu cầu tìm kiếm cho: "${discoveryQuery}"`);
+            
+            // Bước 1: Dùng Gemini tìm URL
+            const urlPrompt = `Tìm kiếm trên Google các trang web bán hàng tại Việt Nam cho sản phẩm "${discoveryQuery}". Trả về một danh sách JSON của tối đa 3 URL sản phẩm trực tiếp. Định dạng: [{"sourceName": "Tên trang web", "url": "URL sản phẩm"}]`;
+            const sources = await callGemini(geminiApiKey, urlPrompt, true);
+            if (!sources || sources.length === 0) return res.status(200).json([]);
+            console.log(`Đã tìm thấy ${sources.length} URL.`);
 
-                if (!priceText) throw new Error("Không tìm thấy giá với selector của AI.");
-                const price = parseFloat(priceText.replace(/[^0-9]/g, ''));
-                if (isNaN(price)) throw new Error("Không phân tích được giá.");
+            // Bước 2-4: Crawl và phân tích từng URL
+            for (const source of sources) {
+                try {
+                    console.log(`Đang xử lý ${source.url}`);
+                    await page.goto(source.url, { waitUntil: 'networkidle2', timeout: 30000 });
+                    const pageHtml = await page.content();
 
-                console.log(`Thành công: ${source.sourceName} - Giá: ${price}`);
-                results.push({
-                    status: 'success',
-                    data: {
-                        product: discoveryQuery,
-                        sourceName: source.sourceName,
-                        url: source.url,
-                        price: price,
-                        selector: selector
-                    }
-                });
-            } catch (err) {
-                console.warn(`Lỗi khi xử lý ${source.url}: ${err.message}`);
-                results.push({ status: 'error', url: source.url, error: err.message });
+                    const selectorPrompt = `Phân tích mã HTML sau và tìm CSS selector chính xác nhất cho giá chính của sản phẩm. Chỉ trả về một đối tượng JSON có dạng {"selector": "your-css-selector"}. HTML: ${pageHtml.substring(0, 5000)}`;
+                    const { selector } = await callGemini(geminiApiKey, selectorPrompt, true);
+                    if (!selector) throw new Error("AI không tìm được selector.");
+
+                    const priceText = await page.evaluate((sel) => {
+                        const el = document.querySelector(sel);
+                        return el ? el.textContent.trim() : null;
+                    }, selector);
+
+                    if (!priceText) throw new Error("Không tìm thấy giá với selector của AI.");
+                    const price = parseFloat(priceText.replace(/[^0-9]/g, ''));
+                    if (isNaN(price)) throw new Error("Không phân tích được giá.");
+
+                    console.log(`Thành công: ${source.sourceName} - Giá: ${price}`);
+                    results.push({
+                        status: 'success',
+                        data: {
+                            product: discoveryQuery,
+                            sourceName: source.sourceName,
+                            url: source.url,
+                            price: price,
+                            selector: selector
+                        }
+                    });
+                } catch (err) {
+                    console.warn(`Lỗi khi xử lý ${source.url}: ${err.message}`);
+                    results.push({ status: 'error', url: source.url, error: err.message });
+                }
             }
         }
         
