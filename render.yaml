@@ -1,0 +1,15 @@
+services:
+  # Tên service của bạn
+  - type: web
+    name: google-shopping-scraper-service
+    env: node
+    # Bắt đầu với gói miễn phí. Lưu ý: Gói miễn phí có thể chậm hoặc bị "ngủ" khi không có truy cập.
+    plan: free 
+    # Lệnh để cài đặt các thư viện từ package.json
+    buildCommand: 'npm install'
+    # Lệnh để khởi động server
+    startCommand: 'npm start'
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 18 # Sử dụng phiên bản Node.js ổn định
