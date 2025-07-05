@@ -1,118 +1,106 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware để cho phép CORS (Cross-Origin Resource Sharing)
+// --- CẤU HÌNH QUAN TRỌNG ---
+// Bạn cần lấy API Key từ Google AI Studio và điền vào đây.
+// Để bảo mật, hãy sử dụng biến môi trường trên Render.com.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "YOUR_GEMINI_API_KEY";
+
+// Cấu hình Proxy chuyên nghiệp (ví dụ: Bright Data, Oxylabs)
+// Thay thế bằng thông tin đăng nhập proxy của bạn.
+const PROXY_USERNAME = process.env.PROXY_USERNAME || "YOUR_PROXY_USERNAME";
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || "YOUR_PROXY_PASSWORD";
+const PROXY_HOST = process.env.PROXY_HOST || "brd.superproxy.io";
+const PROXY_PORT = process.env.PROXY_PORT || "22225";
+const PROXY_URL = `http://${PROXY_USERNAME}:${PROXY_PASSWORD}@${PROXY_HOST}:${PROXY_PORT}`;
+
+// Khởi tạo Gemini AI
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+// Middleware cho CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
     next();
 });
 
-// Endpoint chính để thực hiện việc scrape
 app.get('/scrape', async (req, res) => {
     const { keyword } = req.query;
+    if (!keyword) return res.status(400).json({ error: 'Keyword is required' });
 
-    if (!keyword) {
-        return res.status(400).json({ error: 'Keyword is required' });
+    console.log(`[AI-JOB] Received job for keyword: "${keyword}"`);
+
+    if (GEMINI_API_KEY === "YOUR_GEMINI_API_KEY" || PROXY_USERNAME === "YOUR_PROXY_USERNAME") {
+        console.error("[CONFIG ERROR] Gemini API Key or Proxy credentials are not set.");
+        return res.status(500).json({ error: 'Server configuration is incomplete. Please set API keys and proxy credentials.' });
     }
-
-    console.log(`[INFO] Received job for keyword: "${keyword}"`);
 
     let browser = null;
     try {
+        console.log('[PROXY] Connecting via proxy...');
         browser = await puppeteer.launch({
             headless: true,
             args: [
+                `--proxy-server=${PROXY_URL}`,
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--single-process'
-            ]
+            ],
         });
 
         const page = await browser.newPage();
-        
-        // Chuyển log từ bên trong trình duyệt ảo ra console của Node.js
-        page.on('console', msg => console.log(`[BROWSER LOG] ${msg.text()}`));
-
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
         
         const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(keyword)}&tbm=shop`;
-        
         console.log(`[INFO] Navigating to: ${searchUrl}`);
-        await page.goto(searchUrl, { waitUntil: 'networkidle2' });
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
 
-        // =================== PHẦN CẬP NHẬT CHÍNH ===================
-        // Thêm log chi tiết vào bên trong hàm evaluate
-        const products = await page.evaluate(() => {
-            const results = [];
-            
-            // Định nghĩa các bộ chọn
-            const selector1 = 'div.sh-pr__product-results-grid div.sh-dgr__content';
-            const selector2 = '.sh-dgr__content';
-            const selector3 = 'div.KZmu8e';
+        // Lấy toàn bộ nội dung HTML của trang
+        const htmlContent = await page.content();
+        console.log(`[INFO] Successfully retrieved HTML content (${(htmlContent.length / 1024).toFixed(2)} KB).`);
+        
+        await browser.close();
+        console.log('[INFO] Browser closed. Sending HTML to Gemini AI for parsing.');
 
-            // Thử bộ chọn 1
-            console.log(`[DIAGNOSTIC] Trying selector 1: "${selector1}"`);
-            let items = document.querySelectorAll(selector1);
-            console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 1.`);
+        // Tạo prompt cho Gemini
+        const prompt = `
+            Please act as an expert data extractor. Analyze the following HTML content from a Google Shopping search result page.
+            Extract the product information for each item listed.
+            Your response MUST be a valid JSON array. Each object in the array should have the following keys: "title", "price", and "source".
+            If you cannot find any products, return an empty array [].
+            Do not include any explanation or introductory text, only the JSON array.
 
-            // Thử bộ chọn 2 (dự phòng)
-            if (items.length === 0) {
-                console.log(`[DIAGNOSTIC] Selector 1 failed. Trying selector 2: "${selector2}"`);
-                items = document.querySelectorAll(selector2);
-                console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 2.`);
-            }
-            
-            // Thử bộ chọn 3 (dự phòng)
-            if (items.length === 0) {
-                console.log(`[DIAGNOSTIC] Selector 2 failed. Trying selector 3: "${selector3}"`);
-                items = document.querySelectorAll(selector3);
-                console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 3.`);
-            }
+            HTML Content:
+            \`\`\`html
+            ${htmlContent}
+            \`\`\`
+        `;
 
-            items.forEach((item, index) => {
-                try {
-                    // Thử nhiều bộ chọn cho từng chi tiết
-                    const title = item.querySelector('h3.sh-np__product-title, h3.Xjkr3b')?.innerText;
-                    const price = item.querySelector('.T14wmb > .a8Pemb, span.a8Pemb')?.innerText;
-                    const source = item.querySelector('.E5ocAb, div.aULzUe')?.innerText;
-
-                    if (title && price && source) {
-                        results.push({ title, price, source });
-                    } else {
-                        // Log ra nếu một sản phẩm không đủ thông tin
-                        console.log(`[DIAGNOSTIC] Item ${index + 1} is incomplete. Title: ${!!title}, Price: ${!!price}, Source: ${!!source}`);
-                    }
-                } catch (e) {
-                    console.log(`[DIAGNOSTIC] Error processing item ${index + 1}: ${e.message}`);
-                }
-            });
-            return results;
-        });
-        // =================== KẾT THÚC PHẦN CẬP NHẬT ===================
-
-        console.log(`[INFO] Found and processed ${products.length} products successfully.`);
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        let text = response.text();
+        
+        // Làm sạch output của AI để đảm bảo nó là JSON
+        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        
+        console.log('[AI-RESPONSE] Gemini AI parsed the data. Sending to client.');
+        
+        // Parse và trả về kết quả
+        const products = JSON.parse(text);
         res.status(200).json(products);
 
     } catch (error) {
-        console.error('[ERROR] Scraping failed:', error);
-        res.status(500).json({ error: 'Failed to scrape data. The website structure might have changed or the service encountered an error.' });
-    } finally {
-        if (browser) {
-            await browser.close();
-            console.log('[INFO] Browser closed.');
-        }
+        console.error('[ERROR] AI-Scraping failed:', error);
+        if (browser) await browser.close();
+        res.status(500).json({ error: 'An error occurred during the AI-powered scraping process.' });
     }
 });
 
-app.get('/', (req, res) => {
-    res.status(200).send('Scraper service is running!');
-});
+app.get('/', (req, res) => res.status(200).send('AI Scraper service is running!'));
 
-app.listen(PORT, () => {
-    console.log(`Server is listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`AI Scraper Server is listening on port ${PORT}`));
