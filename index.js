@@ -34,6 +34,10 @@ app.get('/scrape', async (req, res) => {
         });
 
         const page = await browser.newPage();
+        
+        // Chuyển log từ bên trong trình duyệt ảo ra console của Node.js
+        page.on('console', msg => console.log(`[BROWSER LOG] ${msg.text()}`));
+
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
         
         const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(keyword)}&tbm=shop`;
@@ -42,33 +46,56 @@ app.get('/scrape', async (req, res) => {
         await page.goto(searchUrl, { waitUntil: 'networkidle2' });
 
         // =================== PHẦN CẬP NHẬT CHÍNH ===================
-        // Các selector đã được thay đổi để phù hợp với cấu trúc HTML mới của Google.
+        // Thêm log chi tiết vào bên trong hàm evaluate
         const products = await page.evaluate(() => {
             const results = [];
-            // Selector mới cho từng thẻ chứa sản phẩm
-            const items = document.querySelectorAll('.sh-dgr__content');
+            
+            // Định nghĩa các bộ chọn
+            const selector1 = 'div.sh-pr__product-results-grid div.sh-dgr__content';
+            const selector2 = '.sh-dgr__content';
+            const selector3 = 'div.KZmu8e';
 
-            items.forEach(item => {
+            // Thử bộ chọn 1
+            console.log(`[DIAGNOSTIC] Trying selector 1: "${selector1}"`);
+            let items = document.querySelectorAll(selector1);
+            console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 1.`);
+
+            // Thử bộ chọn 2 (dự phòng)
+            if (items.length === 0) {
+                console.log(`[DIAGNOSTIC] Selector 1 failed. Trying selector 2: "${selector2}"`);
+                items = document.querySelectorAll(selector2);
+                console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 2.`);
+            }
+            
+            // Thử bộ chọn 3 (dự phòng)
+            if (items.length === 0) {
+                console.log(`[DIAGNOSTIC] Selector 2 failed. Trying selector 3: "${selector3}"`);
+                items = document.querySelectorAll(selector3);
+                console.log(`[DIAGNOSTIC] Found ${items.length} items with selector 3.`);
+            }
+
+            items.forEach((item, index) => {
                 try {
-                    // Selector mới cho tiêu đề
-                    const title = item.querySelector('h3.sh-np__product-title')?.innerText;
-                    // Selector mới cho giá
-                    const price = item.querySelector('.T14wmb > .a8Pemb')?.innerText;
-                    // Selector mới cho nguồn cung cấp
-                    const source = item.querySelector('.E5ocAb')?.innerText;
+                    // Thử nhiều bộ chọn cho từng chi tiết
+                    const title = item.querySelector('h3.sh-np__product-title, h3.Xjkr3b')?.innerText;
+                    const price = item.querySelector('.T14wmb > .a8Pemb, span.a8Pemb')?.innerText;
+                    const source = item.querySelector('.E5ocAb, div.aULzUe')?.innerText;
 
                     if (title && price && source) {
                         results.push({ title, price, source });
+                    } else {
+                        // Log ra nếu một sản phẩm không đủ thông tin
+                        console.log(`[DIAGNOSTIC] Item ${index + 1} is incomplete. Title: ${!!title}, Price: ${!!price}, Source: ${!!source}`);
                     }
                 } catch (e) {
-                    // Bỏ qua nếu có lỗi ở một sản phẩm cụ thể
+                    console.log(`[DIAGNOSTIC] Error processing item ${index + 1}: ${e.message}`);
                 }
             });
             return results;
         });
         // =================== KẾT THÚC PHẦN CẬP NHẬT ===================
 
-        console.log(`[INFO] Found ${products.length} products.`);
+        console.log(`[INFO] Found and processed ${products.length} products successfully.`);
         res.status(200).json(products);
 
     } catch (error) {
@@ -82,11 +109,9 @@ app.get('/scrape', async (req, res) => {
     }
 });
 
-// Endpoint kiểm tra sức khỏe (health check)
 app.get('/', (req, res) => {
     res.status(200).send('Scraper service is running!');
 });
-
 
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
