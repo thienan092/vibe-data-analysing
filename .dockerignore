@@ -1,0 +1,12 @@
+# Bỏ qua thư mục chứa các thư viện đã cài đặt ở máy local,
+# vì chúng sẽ được cài đặt lại bên trong container.
+node_modules
+
+# Bỏ qua các file log của npm
+npm-debug.log
+
+# Bỏ qua các file cấu hình của Docker và Git, chúng không cần thiết bên trong container
+Dockerfile
+.dockerignore
+.git
+.gitignore
