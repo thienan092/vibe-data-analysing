@@ -1,157 +1,98 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
-const cors = require('cors');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-const port = process.env.PORT || 10000;
+// Render.com sẽ tự động cung cấp biến PORT
+const PORT = process.env.PORT || 3001;
 
-// Sử dụng CORS để cho phép các yêu cầu từ tên miền khác
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-// --- HÀM HỖ TRỢ ---
-
-async function launchBrowser() {
-    return puppeteer.launch({
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
-        ],
-        headless: true,
-    });
-}
-
-async function callGemini(apiKey, prompt, jsonMode = false) {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    
-    if (jsonMode) {
-        const result = await model.generateContent(prompt + "\n\nChỉ trả về JSON, không có markdown.");
-        const response = await result.response;
-        let text = response.text();
-        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        return JSON.parse(text);
-    } else {
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        return response.text();
-    }
-}
-
-// --- ENDPOINTS API ---
-
-app.get('/', (req, res) => {
-    res.status(200).send('Crawl4ai service is running! Version 3.0 (Production Ready)');
+// Middleware để cho phép CORS (Cross-Origin Resource Sharing)
+// Điều này rất quan trọng để trang web của bạn có thể gọi API này
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*'); // Cho phép tất cả các domain
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
 });
 
-app.post('/crawl', async (req, res) => {
-    const { geminiApiKey, discoveryQuery, tasks } = req.body;
+// Endpoint chính để thực hiện việc scrape
+app.get('/scrape', async (req, res) => {
+    const { keyword } = req.query;
 
-    if (!geminiApiKey) return res.status(400).json({ error: 'Thiếu Gemini API Key.' });
-    if (!discoveryQuery && !tasks) return res.status(400).json({ error: 'Phải có discoveryQuery hoặc tasks.' });
+    if (!keyword) {
+        return res.status(400).json({ error: 'Keyword is required' });
+    }
+
+    console.log(`[INFO] Received job for keyword: "${keyword}"`);
 
     let browser = null;
     try {
-        console.log("Khởi động trình duyệt...");
-        browser = await launchBrowser();
+        // Khởi tạo trình duyệt ảo Puppeteer với các tùy chọn cần thiết cho môi trường server (như Render)
+        browser = await puppeteer.launch({
+            headless: true, // Chạy ở chế độ không giao diện
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage', // Cần thiết cho các môi trường container
+                '--single-process'
+            ]
+        });
+
         const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36');
-
-        let results = [];
-
-        // --- LUỒNG 1: KIỂM TRA GIÁ (TASKS) ---
-        if (tasks && tasks.length > 0) {
-            console.log(`Nhận yêu cầu kiểm tra giá cho ${tasks.length} sản phẩm.`);
-            for (const task of tasks) {
-                try {
-                    console.log(`Đang kiểm tra: ${task.url}`);
-                    await page.goto(task.url, { waitUntil: 'networkidle2', timeout: 30000 });
-                    
-                    const priceData = await page.evaluate((sel) => {
-                        const el = document.querySelector(sel);
-                        return {
-                            price: el ? el.textContent.trim() : null,
-                            html: el ? el.outerHTML : null,
-                        };
-                    }, task.selector);
-
-                    if (!priceData.price) throw new Error(`Không tìm thấy giá với selector: ${task.selector}`);
-                    
-                    results.push({ status: 'success', data: priceData });
-                } catch (err) {
-                    console.warn(`Lỗi khi kiểm tra ${task.url}: ${err.message}`);
-                    results.push({ status: 'error', url: task.url, error: err.message });
-                }
-            }
-        }
-        // --- LUỒNG 2: TÌM KIẾM NGUỒN MỚI (DISCOVERY) ---
-        else if (discoveryQuery) {
-            console.log(`Nhận yêu cầu tìm kiếm cho: "${discoveryQuery}"`);
-            
-            // Bước 1: Dùng Gemini tìm URL
-            const urlPrompt = `Tìm kiếm trên Google các trang web bán hàng tại Việt Nam cho sản phẩm "${discoveryQuery}". Trả về một danh sách JSON của tối đa 3 URL sản phẩm trực tiếp. Định dạng: [{"sourceName": "Tên trang web", "url": "URL sản phẩm"}]`;
-            const sources = await callGemini(geminiApiKey, urlPrompt, true);
-            if (!sources || sources.length === 0) return res.status(200).json([]);
-            console.log(`Đã tìm thấy ${sources.length} URL.`);
-
-            // Bước 2-4: Crawl và phân tích từng URL
-            for (const source of sources) {
-                try {
-                    console.log(`Đang xử lý ${source.url}`);
-                    await page.goto(source.url, { waitUntil: 'networkidle2', timeout: 30000 });
-                    const pageHtml = await page.content();
-
-                    const selectorPrompt = `Phân tích mã HTML sau và tìm CSS selector chính xác nhất cho giá chính của sản phẩm. Chỉ trả về một đối tượng JSON có dạng {"selector": "your-css-selector"}. HTML: ${pageHtml.substring(0, 5000)}`;
-                    const { selector } = await callGemini(geminiApiKey, selectorPrompt, true);
-                    if (!selector) throw new Error("AI không tìm được selector.");
-
-                    const priceText = await page.evaluate((sel) => {
-                        const el = document.querySelector(sel);
-                        return el ? el.textContent.trim() : null;
-                    }, selector);
-
-                    if (!priceText) throw new Error("Không tìm thấy giá với selector của AI.");
-                    const price = parseFloat(priceText.replace(/[^0-9]/g, ''));
-                    if (isNaN(price)) throw new Error("Không phân tích được giá.");
-
-                    console.log(`Thành công: ${source.sourceName} - Giá: ${price}`);
-                    results.push({
-                        status: 'success',
-                        data: {
-                            product: discoveryQuery,
-                            sourceName: source.sourceName,
-                            url: source.url,
-                            price: price,
-                            selector: selector
-                        }
-                    });
-                } catch (err) {
-                    console.warn(`Lỗi khi xử lý ${source.url}: ${err.message}`);
-                    results.push({ status: 'error', url: source.url, error: err.message });
-                }
-            }
-        }
         
-        res.status(200).json(results);
+        // Giả lập User-Agent của một trình duyệt thông thường để tránh bị phát hiện
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+        
+        // Tạo URL tìm kiếm trên Google Shopping
+        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(keyword)}&tbm=shop`;
+        
+        console.log(`[INFO] Navigating to: ${searchUrl}`);
+        await page.goto(searchUrl, { waitUntil: 'networkidle2' }); // Chờ trang tải xong
+
+        // Bóc tách dữ liệu từ trang web
+        // LƯU Ý QUAN TRỌNG: Các selector (class name) của Google có thể thay đổi bất cứ lúc nào.
+        // Nếu script không hoạt động, bạn cần vào Google Shopping, dùng "Inspect" để tìm class name mới.
+        const products = await page.evaluate(() => {
+            const results = [];
+            // Selector cho mỗi item sản phẩm
+            const items = document.querySelectorAll('.sh-dgr__gr-auto .sh-dgr__content');
+
+            items.forEach(item => {
+                try {
+                    const title = item.querySelector('h3.tAxDx')?.innerText;
+                    const price = item.querySelector('span.a8Pemb')?.innerText;
+                    const source = item.querySelector('div.aULzUe')?.innerText;
+
+                    // Chỉ thêm vào kết quả nếu có đủ thông tin
+                    if (title && price && source) {
+                        results.push({ title, price, source });
+                    }
+                } catch (e) {
+                    // Bỏ qua nếu có lỗi ở một sản phẩm cụ thể
+                }
+            });
+            return results;
+        });
+
+        console.log(`[INFO] Found ${products.length} products.`);
+        res.status(200).json(products);
 
     } catch (error) {
-        console.error('Lỗi nghiêm trọng trong quá trình /crawl:', error);
-        res.status(500).json({ error: `Lỗi server: ${error.message}` });
+        console.error('[ERROR] Scraping failed:', error);
+        res.status(500).json({ error: 'Failed to scrape data. The website structure might have changed or the service encountered an error.' });
     } finally {
+        // Luôn luôn đóng trình duyệt ảo để giải phóng tài nguyên
         if (browser) {
             await browser.close();
-            console.log("Đã đóng trình duyệt.");
+            console.log('[INFO] Browser closed.');
         }
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server đang lắng nghe tại cổng ${port}`);
+// Endpoint kiểm tra sức khỏe (health check)
+app.get('/', (req, res) => {
+    res.status(200).send('Scraper service is running!');
+});
+
+
+app.listen(PORT, () => {
+    console.log(`Server is listening on port ${PORT}`);
 });
